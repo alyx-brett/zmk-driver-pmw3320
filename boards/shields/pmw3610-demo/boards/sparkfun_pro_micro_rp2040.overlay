@@ -17,8 +17,7 @@
 };
 
 &spi0 {
-  compatible = "raspberrypi,pico-spi";
-	status = "okay";
+	    status = "okay";
 	pinctrl-0 = <&spi0_default>;
 	pinctrl-names = "default";
 	clock-frequency = <DT_FREQ_M(2)>;
