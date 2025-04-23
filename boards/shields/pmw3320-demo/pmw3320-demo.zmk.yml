@@ -1,0 +1,10 @@
+file_format: "1"
+id: pmw3320-demo
+name: "PMW3320 Demo"
+type: shield
+url: https://github.com/alyx-brett/zmk-driver-pmw3320/
+requires: [pro_micro]
+exposes: []
+features:
+  - keys
+  - pointer

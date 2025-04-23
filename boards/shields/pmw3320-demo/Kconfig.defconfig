@@ -1,0 +1,6 @@
+if SHIELD_PMW3320_DEMO
+
+config ZMK_KEYBOARD_NAME
+	default "pmw3320-demo"
+
+endif

@@ -1,0 +1,26 @@
+description: |
+  Sensor driver for the pixart PMW3320 mouse sensor
+
+compatible: "pixart,pmw3320"
+
+include: spi-device.yaml
+
+properties:
+  irq-gpios:
+    type: phandle-array
+    required: true
+  cpi:
+    type: int
+    default: 500
+    description: "CPI value (Range: 250 - 3500, Step: 250)"
+  evt-type:
+    type: int
+    required: true
+  x-input-code:
+    type: int
+    required: true
+  y-input-code:
+    type: int
+    required: true
+  force-awake:
+    type: boolean

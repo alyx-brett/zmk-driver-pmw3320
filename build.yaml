@@ -1,3 +1,5 @@
 include:
     - board: sparkfun_pro_micro_rp2040
       shield: pmw3610-demo
+    - board: sparkfun_pro_micro_rp2040
+      shield: pmw3320-demo

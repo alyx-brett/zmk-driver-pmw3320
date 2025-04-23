@@ -1,0 +1,25 @@
+#include <dt-bindings/pinctrl/rpi-pico-rp2040-pinctrl.h>
+#include <freq.h>
+
+&pinctrl {
+	spi0_default: spi0_default {
+		group1 {
+			pinmux = <SPI0_RX_P20>;
+		};
+		group2 {
+			pinmux = <SPI0_RX_P20>;
+			input-enable;
+		};
+		group3 {
+			pinmux = <SPI0_SCK_P22>;
+		};
+	};
+};
+
+&spi0 {
+  compatible = "raspberrypi,pico-spi";
+	status = "okay";
+	pinctrl-0 = <&spi0_default>;
+	pinctrl-names = "default";
+	clock-frequency = <DT_FREQ_M(2)>;
+};
