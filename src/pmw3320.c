@@ -22,7 +22,6 @@ LOG_MODULE_REGISTER(pmw3320, CONFIG_PMW3320_LOG_LEVEL);
 // delayable work is defined for this purpose           //
 enum pmw3320_init_step {
     ASYNC_INIT_STEP_POWER_UP,  // reset cs line and assert power-up reset
-    ASYNC_INIT_STEP_CLEAR_OB1, // clear observation1 register for self-test check
     ASYNC_INIT_STEP_CHECK_OB1, // check the value of observation1 register after self-test check
     ASYNC_INIT_STEP_CONFIGURE, // set other registes like cpi and donwshift time (run, rest1, rest2)
                                // and clear motion registers
@@ -34,9 +33,7 @@ enum pmw3320_init_step {
 // - Since MCU is not involved in the sensor init process, i is allowed to do other tasks.
 //   Thus, k_sleep or delayed schedule can be used.
 static const int32_t async_init_delay[ASYNC_INIT_STEP_COUNT] = {
-    [ASYNC_INIT_STEP_POWER_UP] = 10 + CONFIG_PMW3320_INIT_POWER_UP_EXTRA_DELAY_MS, // >10ms needed
-    [ASYNC_INIT_STEP_CLEAR_OB1] = 200, // 150 us required, test shows too short,
-                                       // also power-up reset is added in this step, thus using 50 ms
+    [ASYNC_INIT_STEP_POWER_UP] = 50 + CONFIG_PMW3320_INIT_POWER_UP_EXTRA_DELAY_MS, // >10ms needed
     [ASYNC_INIT_STEP_CHECK_OB1] = 50,  // 10 ms required in spec,
                                        // test shows too short,
                                        // especially when integrated with display,
@@ -45,13 +42,11 @@ static const int32_t async_init_delay[ASYNC_INIT_STEP_COUNT] = {
 };
 
 static int pmw3320_async_init_power_up(const struct device *dev);
-static int pmw3320_async_init_clear_ob1(const struct device *dev);
 static int pmw3320_async_init_check_ob1(const struct device *dev);
 static int pmw3320_async_init_configure(const struct device *dev);
 
 static int (*const async_init_fn[ASYNC_INIT_STEP_COUNT])(const struct device *dev) = {
     [ASYNC_INIT_STEP_POWER_UP] = pmw3320_async_init_power_up,
-    [ASYNC_INIT_STEP_CLEAR_OB1] = pmw3320_async_init_clear_ob1,
     [ASYNC_INIT_STEP_CHECK_OB1] = pmw3320_async_init_check_ob1,
     [ASYNC_INIT_STEP_CONFIGURE] = pmw3320_async_init_configure,
 };
@@ -83,40 +78,33 @@ static int pmw3320_write(const struct device *dev, uint8_t addr, uint8_t value) 
 }
 
 static int pmw3320_set_cpi(const struct device *dev, uint32_t cpi) {
-    /* Set resolution with CPI step of 250 cpi
-     * 0x1: 250 cpi (minimum cpi)
-     * 0x2: 500 cpi
-     * 0x3: 750 cpi
-     * :
-     */
+  /* PMW3320 valid resolution appears to range from 0x80 to 0x9f: The datasheet
+     says 'max 3500, step 250'.
 
-    if ((cpi > PMW3320_MAX_CPI) || (cpi < PMW3320_MIN_CPI)) {
-        LOG_ERR("CPI value %u out of range", cpi);
-        return -EINVAL;
-    }
+     Let's assign 250 CPI = 0x80, 3500 CPI = 0x9f, and linearly interpolate. If
+     someone measures this differently, I'll fix it.
+   */
 
-    // Convert CPI to register value
-    uint8_t value = (cpi / 250);
-    LOG_INF("Setting CPI to %u (reg value 0x%x)", cpi, value);
+    uint8_t value = 0x80 + (3500 - 250)/(0x9f - 0x80);
+    LOG_INF("Setting CPI to '%u' (reg value 0x%x)", cpi, value);
 
-    /* set the cpi */
-    uint8_t addr[] = {0x7F, PMW3320_REG_RES_STEP, 0x7F};
-    uint8_t data[] = {0xFF, value, 0x00};
-
-    /* Write data */
-    int err;
-    for (size_t i = 0; i < sizeof(data); i++) {
-        err = pmw3320_write_reg(dev, addr[i], data[i]);
-        if (err) {
-            LOG_ERR("Burst write failed on SPI write (data)");
-            break;
-        }
-    }
-
+    int err = pmw3320_write(dev, PMW3320_REG_RESOLUTION, value);
     if (err) {
         LOG_ERR("Failed to set CPI");
         return err;
     }
+
+#if CONFIG_LOG
+
+    uint8_t buf[1];
+    err = pmw3320_read_reg(dev,PMW3320_REG_RESOLUTION, buf);
+    if (err) {
+        LOG_ERR("Failed to read CPI");
+        return err;
+    }
+    LOG_INF("CPI now reads out 0x%x", buf[0]);
+
+#endif
 
     return 0;
 }
@@ -134,7 +122,7 @@ static int pmw3320_set_sample_time(const struct device *dev, uint8_t reg_addr, u
     LOG_INF("Set sample time to %u ms (reg value: 0x%x)", sample_time, value);
 
     /* The sample time is (reg_value * mintime ) ms. 0x00 is rounded to 0x1 */
-    int err = pmw3610_write(dev, reg_addr, value);
+    int err = pmw3320_write(dev, reg_addr, value);
     if (err) {
         LOG_ERR("Failed to change sample time");
     }
@@ -144,37 +132,34 @@ static int pmw3320_set_sample_time(const struct device *dev, uint8_t reg_addr, u
 
 /* Set downshift time in ms. */
 // NOTE: The unit of run-mode downshift is related to pos mode rate, which is hard coded to be 4 ms
-// The pos-mode rate is configured in pmw3610_async_init_configure
-static int pmw3610_set_downshift_time(const struct device *dev, uint8_t reg_addr, uint32_t time) {
+// The pos-mode rate is configured in pmw3320_async_init_configure
+static int pmw3320_set_downshift_time(const struct device *dev, uint8_t reg_addr, uint32_t time) {
     uint32_t maxtime;
     uint32_t mintime;
 
     switch (reg_addr) {
-    case PMW3610_REG_RUN_DOWNSHIFT:
-        /*
-         * Run downshift time = PMW3610_REG_RUN_DOWNSHIFT
+    case PMW3320_REG_RUN_DOWNSHIFT:
+        /* Run downshift time = PMW3320_REG_RUN_DOWNSHIFT
          *                      * 8 * pos-rate (fixed to 4ms)
          */
         maxtime = 8160; // 32 * 255;
-        mintime = 32; // hard-coded in pmw3610_async_init_configure
+        mintime = 32; // hard-coded in pmw3320_async_init_configure
         break;
 
-    case PMW3610_REG_REST1_DOWNSHIFT:
-        /*
-         * Rest1 downshift time = PMW3610_REG_RUN_DOWNSHIFT
+    case PMW3320_REG_REST1_DOWNSHIFT:
+        /* Rest1 downshift time = PMW3320_REG_RUN_DOWNSHIFT
          *                        * 16 * Rest1_sample_period (default 40 ms)
          */
-        maxtime = 255 * 16 * CONFIG_PMW3610_REST1_SAMPLE_TIME_MS;
-        mintime = 16 * CONFIG_PMW3610_REST1_SAMPLE_TIME_MS;
+        maxtime = 255 * 16 * CONFIG_PMW3320_REST1_SAMPLE_TIME_MS;
+        mintime = 16 * CONFIG_PMW3320_REST1_SAMPLE_TIME_MS;
         break;
 
-    case PMW3610_REG_REST2_DOWNSHIFT:
-        /*
-         * Rest2 downshift time = PMW3610_REG_REST2_DOWNSHIFT
+    case PMW3320_REG_REST2_DOWNSHIFT:
+        /* Rest2 downshift time = PMW3320_REG_REST2_DOWNSHIFT
          *                        * 128 * Rest2 rate (default 100 ms)
          */
-        maxtime = 255 * 128 * CONFIG_PMW3610_REST2_SAMPLE_TIME_MS;
-        mintime = 128 * CONFIG_PMW3610_REST2_SAMPLE_TIME_MS;
+        maxtime = 255 * 128 * CONFIG_PMW3320_REST2_SAMPLE_TIME_MS;
+        mintime = 128 * CONFIG_PMW3320_REST2_SAMPLE_TIME_MS;
         break;
 
     default:
@@ -194,7 +179,7 @@ static int pmw3610_set_downshift_time(const struct device *dev, uint8_t reg_addr
 
     LOG_INF("Set downshift time to %u ms (reg value 0x%x)", time, value);
 
-    int err = pmw3610_write(dev, reg_addr, value);
+    int err = pmw3320_write(dev, reg_addr, value);
     if (err) {
         LOG_ERR("Failed to change downshift time");
     }
@@ -202,13 +187,13 @@ static int pmw3610_set_downshift_time(const struct device *dev, uint8_t reg_addr
     return err;
 }
 
-static int pmw3610_set_performance(const struct device *dev, bool enabled) {
+static int pmw3320_set_performance(const struct device *dev, bool enabled) {
     const struct pixart_config *config = dev->config;
     int err = 0;
 
     if (config->force_awake) {
         uint8_t value;
-        err = pmw3610_read_reg(dev, PMW3610_REG_PERFORMANCE, &value);
+        err = pmw3320_read_reg(dev, PMW3320_REG_PERFORMANCE, &value);
         if (err) {
             LOG_ERR("Can't read ref-performance %d", err);
             return err;
@@ -220,7 +205,7 @@ static int pmw3610_set_performance(const struct device *dev, bool enabled) {
             perf |= 0xF0; // set bit[3..0] to 0xF (force awake)
         }
         if (perf != value) {
-            err = pmw3610_write(dev, PMW3610_REG_PERFORMANCE, perf);
+            err = pmw3320_write(dev, PMW3320_REG_PERFORMANCE, perf);
             if (err) {
                 LOG_ERR("Can't write performance register %d", err);
                 return err;
@@ -232,7 +217,7 @@ static int pmw3610_set_performance(const struct device *dev, bool enabled) {
     return err;
 }
 
-static int pmw3610_set_interrupt(const struct device *dev, const bool en) {
+static int pmw3320_set_interrupt(const struct device *dev, const bool en) {
     const struct pixart_config *config = dev->config;
     int ret = gpio_pin_interrupt_configure_dt(&config->irq_gpio,
                                               en ? GPIO_INT_LEVEL_ACTIVE : GPIO_INT_DISABLE);
@@ -242,92 +227,76 @@ static int pmw3610_set_interrupt(const struct device *dev, const bool en) {
     return ret;
 }
 
-static int pmw3610_async_init_power_up(const struct device *dev) {
-	int ret = pmw3610_write_reg(dev, PMW3610_REG_POWER_UP_RESET, PMW3610_POWERUP_CMD_RESET);
+static int pmw3320_async_init_power_up(const struct device *dev) {
+	int ret = pmw3320_write(dev, PMW3320_REG_POWER_UP_RESET, PMW3320_POWERUP_CMD_RESET);
     if (ret < 0) {
         return ret;
     }
     return 0;
 }
 
-static int pmw3610_async_init_clear_ob1(const struct device *dev) {
-    return pmw3610_write(dev, PMW3610_REG_OBSERVATION, 0x00);
-}
-
-static int pmw3610_async_init_check_ob1(const struct device *dev) {
-    uint8_t value;
-    int err = pmw3610_read_reg(dev, PMW3610_REG_OBSERVATION, &value);
-    if (err) {
-        LOG_ERR("Can't do self-test");
-        return err;
-    }
-
-    if ((value & 0x0F) != 0x0F) {
-        LOG_ERR("Failed self-test (0x%x)", value);
-        return -EINVAL;
-    }
-
+static int pmw3320_async_init_check_ob1(const struct device *dev) {
     uint8_t product_id = 0x01;
-    err = pmw3610_read_reg(dev, PMW3610_REG_PRODUCT_ID, &product_id);
+    int err = pmw3320_read_reg(dev, PMW3320_REG_PRODUCT_ID, &product_id);
     if (err) {
         LOG_ERR("Cannot obtain product id");
         return err;
     }
 
-    if (product_id != PMW3610_PRODUCT_ID) {
-        LOG_ERR("Incorrect product id 0x%x (expecting 0x%x)!", product_id, PMW3610_PRODUCT_ID);
+    if (product_id != PMW3320_PRODUCT_ID) {
+        LOG_ERR("Incorrect product id 0x%x (expecting 0x%x)!", product_id, PMW3320_PRODUCT_ID);
         return -EIO;
     }
 
     return 0;
 }
 
-static int pmw3610_async_init_configure(const struct device *dev) {
+static int pmw3320_async_init_configure(const struct device *dev) {
     int err = 0;
     const struct pixart_config *config = dev->config;
 
     // clear motion registers first (required in datasheet)
     for (uint8_t reg = 0x02; (reg <= 0x05) && !err; reg++) {
         uint8_t buf[1];
-        err = pmw3610_read_reg(dev, reg, buf);
+        err = pmw3320_read_reg(dev, reg, buf);
     }
 
     if (!err) {
-        err = pmw3610_set_performance(dev, true);
+        err = pmw3320_set_performance(dev, true);
     }
 
     if (!err) {
-        err = pmw3610_set_cpi(dev, config->cpi);
+        err = pmw3320_set_cpi(dev, config->cpi);
     }
 
     if (!err) {
-        err = pmw3610_set_downshift_time(dev, PMW3610_REG_RUN_DOWNSHIFT,
-                                         CONFIG_PMW3610_RUN_DOWNSHIFT_TIME_MS);
+        err = pmw3320_set_downshift_time(dev, PMW3320_REG_RUN_DOWNSHIFT,
+                                         CONFIG_PMW3320_RUN_DOWNSHIFT_TIME_MS);
     }
 
     if (!err) {
-        err = pmw3610_set_downshift_time(dev, PMW3610_REG_REST1_DOWNSHIFT,
-                                         CONFIG_PMW3610_REST1_DOWNSHIFT_TIME_MS);
+        err = pmw3320_set_downshift_time(dev, PMW3320_REG_REST1_DOWNSHIFT,
+                                         CONFIG_PMW3320_REST1_DOWNSHIFT_TIME_MS);
     }
 
     if (!err) {
-        err = pmw3610_set_downshift_time(dev, PMW3610_REG_REST2_DOWNSHIFT,
-                                         CONFIG_PMW3610_REST2_DOWNSHIFT_TIME_MS);
+        err = pmw3320_set_downshift_time(dev, PMW3320_REG_REST2_DOWNSHIFT,
+                                         CONFIG_PMW3320_REST2_DOWNSHIFT_TIME_MS);
     }
 
     if (!err) {
-        err = pmw3610_set_sample_time(dev, PMW3610_REG_REST1_RATE,
-                                      CONFIG_PMW3610_REST1_SAMPLE_TIME_MS);
+        err = pmw3320_set_sample_time(dev, PMW3320_REG_REST1_PERIOD,
+                                      CONFIG_PMW3320_REST1_SAMPLE_TIME_MS);
     }
 
     if (!err) {
-        err = pmw3610_set_sample_time(dev, PMW3610_REG_REST2_RATE,
-                                      CONFIG_PMW3610_REST2_SAMPLE_TIME_MS);
+        err = pmw3320_set_sample_time(dev, PMW3320_REG_REST2_PERIOD,
+                                      CONFIG_PMW3320_REST2_SAMPLE_TIME_MS);
     }
 
     if (!err) {
-        err = pmw3610_set_sample_time(dev, PMW3610_REG_REST3_RATE,
-                                      CONFIG_PMW3610_REST3_SAMPLE_TIME_MS);
+        err = pmw3320_set_sample_time(dev, PMW3320_REG_REST3_PERIOD,
+                                      CONFIG_PMW3320_REST3_SAMPLE_TIME_MS);
     }
 
     if (err) {
@@ -338,33 +307,32 @@ static int pmw3610_async_init_configure(const struct device *dev) {
     return 0;
 }
 
-static void pmw3610_async_init(struct k_work *work) {
+static void pmw3320_async_init(struct k_work *work) {
     struct k_work_delayable *work2 = (struct k_work_delayable *)work;
     struct pixart_data *data = CONTAINER_OF(work2, struct pixart_data, init_work);
     const struct device *dev = data->dev;
 
-    LOG_INF("PMW3610 async init step %d", data->async_init_step);
+    LOG_INF("PMW3320 async init step %d", data->async_init_step);
 
     data->err = async_init_fn[data->async_init_step](dev);
     if (data->err) {
-        LOG_ERR("PMW3610 initialization failed in step %d", data->async_init_step);
+        LOG_ERR("PMW3320 initialization failed in step %d", data->async_init_step);
     } else {
         data->async_init_step++;
 
         if (data->async_init_step == ASYNC_INIT_STEP_COUNT) {
             data->ready = true; // sensor is ready to work
-            LOG_INF("PMW3610 initialized");
-            pmw3610_set_interrupt(dev, true);
+            LOG_INF("PMW3320 initialized");
+            pmw3320_set_interrupt(dev, true);
         } else {
             k_work_schedule(&data->init_work, K_MSEC(async_init_delay[data->async_init_step]));
         }
     }
 }
 
-static int pmw3610_report_data(const struct device *dev) {
+static int pmw3320_report_data(const struct device *dev) {
     struct pixart_data *data = dev->data;
     const struct pixart_config *config = dev->config;
-    uint8_t buf[PMW3610_BURST_SIZE];
 
     if (unlikely(!data->ready)) {
         LOG_WRN("Device is not initialized yet");
@@ -374,54 +342,43 @@ static int pmw3610_report_data(const struct device *dev) {
     static int64_t dx = 0;
     static int64_t dy = 0;
 
-#if CONFIG_PMW3610_REPORT_INTERVAL_MIN > 0
+#if CONFIG_PMW3320_REPORT_INTERVAL_MIN > 0
     static int64_t last_smp_time = 0;
     static int64_t last_rpt_time = 0;
     int64_t now = k_uptime_get();
 #endif
 
-	int err = pmw3610_read(dev, PMW3610_REG_MOTION_BURST, buf, sizeof(buf));
+    int err;
+    uint8_t buf[PMW3320_BURST_SIZE];
+    err = pmw3320_read(dev, PMW3320_REG_MOTION_BURST, buf, sizeof(buf));
     if (err) {
-        return err;
+      return err;
     }
-    // LOG_HEXDUMP_DBG(buf, sizeof(buf), "buf");
+    LOG_HEXDUMP_DBG(buf, sizeof(buf), "buf");
 
 // 12-bit two's complement value to int16_t
 // adapted from https://stackoverflow.com/questions/70802306/convert-a-12-bit-signed-number-in-c
 #define TOINT16(val, bits) (((struct { int16_t value : bits; }){val}).value)
 
-    int16_t x = TOINT16((buf[PMW3610_X_L_POS] + ((buf[PMW3610_XY_H_POS] & 0xF0) << 4)), 12);
-    int16_t y = TOINT16((buf[PMW3610_Y_L_POS] + ((buf[PMW3610_XY_H_POS] & 0x0F) << 8)), 12);
+    int16_t x = TOINT16((buf[PMW3320_X_L_POS] + ((buf[PMW3320_XY_H_POS] & 0xF0) << 4)), 12);
+    int16_t y = TOINT16((buf[PMW3320_Y_L_POS] + ((buf[PMW3320_XY_H_POS] & 0x0F) << 8)), 12);
     LOG_DBG("x/y: %d/%d", x, y);
 
-#if IS_ENABLED(CONFIG_PMW3610_SWAP_XY)
+#if IS_ENABLED(CONFIG_PMW3320_SWAP_XY)
     int16_t a = x;
     x = y;
     y = a;
 #endif
-#if IS_ENABLED(CONFIG_PMW3610_INVERT_X)
+#if IS_ENABLED(CONFIG_PMW3320_INVERT_X)
     x = -x;
 #endif
-#if IS_ENABLED(CONFIG_PMW3610_INVERT_Y)
+#if IS_ENABLED(CONFIG_PMW3320_INVERT_Y)
     y = -y;
 #endif
 
-#ifdef CONFIG_PMW3610_SMART_ALGORITHM
-    int16_t shutter = ((int16_t)(buf[PMW3610_SHUTTER_H_POS] & 0x01) << 8) 
-                    + buf[PMW3610_SHUTTER_L_POS];
-    if (data->sw_smart_flag && shutter < 45) {
-        pmw3610_write(dev, 0x32, 0x00);
-        data->sw_smart_flag = false;
-    }
-    if (!data->sw_smart_flag && shutter > 45) {
-        pmw3610_write(dev, 0x32, 0x80);
-        data->sw_smart_flag = true;
-    }
-#endif
-
-#if CONFIG_PMW3610_REPORT_INTERVAL_MIN > 0
+#if CONFIG_PMW3320_REPORT_INTERVAL_MIN > 0
     // purge accumulated delta, if last sampled had not been reported on last report tick
-    if (now - last_smp_time >= CONFIG_PMW3610_REPORT_INTERVAL_MIN) {
+    if (now - last_smp_time >= CONFIG_PMW3320_REPORT_INTERVAL_MIN) {
         dx = 0;
         dy = 0;
     }
@@ -432,9 +389,9 @@ static int pmw3610_report_data(const struct device *dev) {
     dx += x;
     dy += y;
 
-#if CONFIG_PMW3610_REPORT_INTERVAL_MIN > 0
+#if CONFIG_PMW3320_REPORT_INTERVAL_MIN > 0
     // strict to report inerval
-    if (now - last_rpt_time < CONFIG_PMW3610_REPORT_INTERVAL_MIN) {
+    if (now - last_rpt_time < CONFIG_PMW3320_REPORT_INTERVAL_MIN) {
         return 0;
     }
 #endif
@@ -446,7 +403,7 @@ static int pmw3610_report_data(const struct device *dev) {
     bool have_y = ry != 0;
 
     if (have_x || have_y) {
-#if CONFIG_PMW3610_REPORT_INTERVAL_MIN > 0
+#if CONFIG_PMW3320_REPORT_INTERVAL_MIN > 0
         last_rpt_time = now;
 #endif
         dx = 0;
@@ -462,22 +419,22 @@ static int pmw3610_report_data(const struct device *dev) {
     return err;
 }
 
-static void pmw3610_gpio_callback(const struct device *gpiob, struct gpio_callback *cb,
+static void pmw3320_gpio_callback(const struct device *gpiob, struct gpio_callback *cb,
                                   uint32_t pins) {
     struct pixart_data *data = CONTAINER_OF(cb, struct pixart_data, irq_gpio_cb);
     const struct device *dev = data->dev;
-    pmw3610_set_interrupt(dev, false);
+    pmw3320_set_interrupt(dev, false);
     k_work_submit(&data->trigger_work);
 }
 
-static void pmw3610_work_callback(struct k_work *work) {
+static void pmw3320_work_callback(struct k_work *work) {
     struct pixart_data *data = CONTAINER_OF(work, struct pixart_data, trigger_work);
     const struct device *dev = data->dev;
-    pmw3610_report_data(dev);
-    pmw3610_set_interrupt(dev, true);
+    pmw3320_report_data(dev);
+    pmw3320_set_interrupt(dev, true);
 }
 
-static int pmw3610_init_irq(const struct device *dev) {
+static int pmw3320_init_irq(const struct device *dev) {
     int err;
     struct pixart_data *data = dev->data;
     const struct pixart_config *config = dev->config;
@@ -496,7 +453,7 @@ static int pmw3610_init_irq(const struct device *dev) {
     }
 
     // setup and add the irq callback associated
-    gpio_init_callback(&data->irq_gpio_cb, pmw3610_gpio_callback, BIT(config->irq_gpio.pin));
+    gpio_init_callback(&data->irq_gpio_cb, pmw3320_gpio_callback, BIT(config->irq_gpio.pin));
 
     err = gpio_add_callback(config->irq_gpio.port, &data->irq_gpio_cb);
     if (err) {
@@ -506,7 +463,7 @@ static int pmw3610_init_irq(const struct device *dev) {
     return err;
 }
 
-static int pmw3610_init(const struct device *dev) {
+static int pmw3320_init(const struct device *dev) {
     struct pixart_data *data = dev->data;
     const struct pixart_config *config = dev->config;
     int err;
@@ -523,10 +480,10 @@ static int pmw3610_init(const struct device *dev) {
     data->sw_smart_flag = false;
 
     // init trigger handler work
-    k_work_init(&data->trigger_work, pmw3610_work_callback);
+    k_work_init(&data->trigger_work, pmw3320_work_callback);
 
     // init irq routine
-    err = pmw3610_init_irq(dev);
+    err = pmw3320_init_irq(dev);
     if (err) {
         return err;
     }
@@ -536,14 +493,14 @@ static int pmw3610_init(const struct device *dev) {
     // 2. upload initial settings
     // 3. other configs like cpi, downshift time, sample time etc.
     // The sensor is ready to work (i.e., data->ready=true after the above steps are finished)
-    k_work_init_delayable(&data->init_work, pmw3610_async_init);
+    k_work_init_delayable(&data->init_work, pmw3320_async_init);
 
     k_work_schedule(&data->init_work, K_MSEC(async_init_delay[data->async_init_step]));
 
     return err;
 }
 
-static int pmw3610_attr_set(const struct device *dev, enum sensor_channel chan,
+static int pmw3320_attr_set(const struct device *dev, enum sensor_channel chan,
                             enum sensor_attribute attr, const struct sensor_value *val) {
     struct pixart_data *data = dev->data;
     int err;
@@ -558,32 +515,32 @@ static int pmw3610_attr_set(const struct device *dev, enum sensor_channel chan,
     }
 
     switch ((uint32_t)attr) {
-    case PMW3610_ATTR_CPI:
-        err = pmw3610_set_cpi(dev, PMW3610_SVALUE_TO_CPI(*val));
+    case PMW3320_ATTR_CPI:
+        err = pmw3320_set_cpi(dev, PMW3320_SVALUE_TO_CPI(*val));
         break;
 
-    case PMW3610_ATTR_RUN_DOWNSHIFT_TIME:
-        err = pmw3610_set_downshift_time(dev, PMW3610_REG_RUN_DOWNSHIFT, PMW3610_SVALUE_TO_TIME(*val));
+    case PMW3320_ATTR_RUN_DOWNSHIFT_TIME:
+        err = pmw3320_set_downshift_time(dev, PMW3320_REG_RUN_DOWNSHIFT, PMW3320_SVALUE_TO_TIME(*val));
         break;
 
-    case PMW3610_ATTR_REST1_DOWNSHIFT_TIME:
-        err = pmw3610_set_downshift_time(dev, PMW3610_REG_REST1_DOWNSHIFT, PMW3610_SVALUE_TO_TIME(*val));
+    case PMW3320_ATTR_REST1_DOWNSHIFT_TIME:
+        err = pmw3320_set_downshift_time(dev, PMW3320_REG_REST1_DOWNSHIFT, PMW3320_SVALUE_TO_TIME(*val));
         break;
 
-    case PMW3610_ATTR_REST2_DOWNSHIFT_TIME:
-        err = pmw3610_set_downshift_time(dev, PMW3610_REG_REST2_DOWNSHIFT, PMW3610_SVALUE_TO_TIME(*val));
+    case PMW3320_ATTR_REST2_DOWNSHIFT_TIME:
+        err = pmw3320_set_downshift_time(dev, PMW3320_REG_REST2_DOWNSHIFT, PMW3320_SVALUE_TO_TIME(*val));
         break;
 
-    case PMW3610_ATTR_REST1_SAMPLE_TIME:
-        err = pmw3610_set_sample_time(dev, PMW3610_REG_REST1_RATE, PMW3610_SVALUE_TO_TIME(*val));
+    case PMW3320_ATTR_REST1_SAMPLE_TIME:
+        err = pmw3320_set_sample_time(dev, PMW3320_REG_REST1_PERIOD, PMW3320_SVALUE_TO_TIME(*val));
         break;
 
-    case PMW3610_ATTR_REST2_SAMPLE_TIME:
-        err = pmw3610_set_sample_time(dev, PMW3610_REG_REST2_RATE, PMW3610_SVALUE_TO_TIME(*val));
+    case PMW3320_ATTR_REST2_SAMPLE_TIME:
+        err = pmw3320_set_sample_time(dev, PMW3320_REG_REST2_PERIOD, PMW3320_SVALUE_TO_TIME(*val));
         break;
 
-    case PMW3610_ATTR_REST3_SAMPLE_TIME:
-        err = pmw3610_set_sample_time(dev, PMW3610_REG_REST3_RATE, PMW3610_SVALUE_TO_TIME(*val));
+    case PMW3320_ATTR_REST3_SAMPLE_TIME:
+        err = pmw3320_set_sample_time(dev, PMW3320_REG_REST3_PERIOD, PMW3320_SVALUE_TO_TIME(*val));
         break;
 
     default:
@@ -594,18 +551,18 @@ static int pmw3610_attr_set(const struct device *dev, enum sensor_channel chan,
     return err;
 }
 
-static const struct sensor_driver_api pmw3610_driver_api = {
-    .attr_set = pmw3610_attr_set,
+static const struct sensor_driver_api pmw3320_driver_api = {
+    .attr_set = pmw3320_attr_set,
 };
 
 #if IS_ENABLED(CONFIG_PM_DEVICE)
 
-static int pmw3610_pm_action(const struct device *dev, enum pm_device_action action) {
+static int pmw3320_pm_action(const struct device *dev, enum pm_device_action action) {
     switch (action) {
     case PM_DEVICE_ACTION_SUSPEND:
-        return pmw3610_set_interrupt(dev, false);
+        return pmw3320_set_interrupt(dev, false);
     case PM_DEVICE_ACTION_RESUME:
-        return pmw3610_set_interrupt(dev, true);
+        return pmw3320_set_interrupt(dev, true);
     default:
         return -ENOTSUP;
     }
@@ -613,31 +570,30 @@ static int pmw3610_pm_action(const struct device *dev, enum pm_device_action act
 
 #endif // IS_ENABLED(CONFIG_PM_DEVICE)
 
-#define PMW3610_SPI_MODE (SPI_OP_MODE_MASTER | SPI_WORD_SET(8) | SPI_MODE_CPOL | \
-                        SPI_MODE_CPHA | SPI_TRANSFER_MSB)
+#define PMW3320_SPI_MODE (SPI_OP_MODE_MASTER | SPI_WORD_SET(8) | SPI_MODE_CPOL | \
+                          SPI_MODE_CPHA | SPI_TRANSFER_MSB)
 
-#define PMW3610_DEFINE(n)                                                                          \
-    static struct pixart_data data##n;                                                             \
-    static const struct pixart_config config##n = {                                                \
-		.spi = SPI_DT_SPEC_INST_GET(n, PMW3610_SPI_MODE, 0),		                               \
-        .irq_gpio = GPIO_DT_SPEC_INST_GET(n, irq_gpios),                                           \
-        .cpi = DT_PROP(DT_DRV_INST(n), cpi),                                                       \
-        .evt_type = DT_PROP(DT_DRV_INST(n), evt_type),                                             \
-        .x_input_code = DT_PROP(DT_DRV_INST(n), x_input_code),                                     \
-        .y_input_code = DT_PROP(DT_DRV_INST(n), y_input_code),                                     \
-        .force_awake = DT_PROP(DT_DRV_INST(n), force_awake),                                       \
-    };                                                                                             \
-    PM_DEVICE_DT_INST_DEFINE(n, pmw3610_pm_action);                                                \
-    DEVICE_DT_INST_DEFINE(n, pmw3610_init, NULL, &data##n, &config##n, POST_KERNEL,                \
-                          CONFIG_INPUT_PMW3610_INIT_PRIORITY, &pmw3610_driver_api);
+#define PMW3320_DEFINE(n)                                               \
+  static struct pixart_data data##n;                                    \
+    static const struct pixart_config config##n = {                                \
+		.spi = SPI_DT_SPEC_INST_GET(n, PMW3320_SPI_MODE, 0),		                       \
+        .irq_gpio = GPIO_DT_SPEC_INST_GET(n, irq_gpios),                           \
+        .cpi = DT_PROP(DT_DRV_INST(n), cpi),                                       \
+        .evt_type = DT_PROP(DT_DRV_INST(n), evt_type),                             \
+        .x_input_code = DT_PROP(DT_DRV_INST(n), x_input_code),                     \
+        .y_input_code = DT_PROP(DT_DRV_INST(n), y_input_code),                     \
+        .force_awake = DT_PROP(DT_DRV_INST(n), force_awake),                       \
+    };                                                                             \
+    PM_DEVICE_DT_INST_DEFINE(n, pmw3320_pm_action);                                \
+    DEVICE_DT_INST_DEFINE(n, pmw3320_init, NULL, &data##n, &config##n, POST_KERNEL,\
+                          CONFIG_INPUT_PMW3320_INIT_PRIORITY, &pmw3320_driver_api);
 
-DT_INST_FOREACH_STATUS_OKAY(PMW3610_DEFINE)
+DT_INST_FOREACH_STATUS_OKAY(PMW3320_DEFINE)
 
+#define GET_PMW3320_DEV(node_id) DEVICE_DT_GET(node_id),
 
-#define GET_PMW3610_DEV(node_id) DEVICE_DT_GET(node_id),
-
-static const struct device *pmw3610_devs[] = {
-    DT_FOREACH_STATUS_OKAY(pixart_pmw3610, GET_PMW3610_DEV)
+static const struct device *pmw3320_devs[] = {
+    DT_FOREACH_STATUS_OKAY(pixart_pmw3320, GET_PMW3320_DEV)
 };
 
 static int on_activity_state(const zmk_event_t *eh) {
@@ -649,12 +605,12 @@ static int on_activity_state(const zmk_event_t *eh) {
     }
 
     bool enable = state_ev->state == ZMK_ACTIVITY_ACTIVE ? 1 : 0;
-    for (size_t i = 0; i < ARRAY_SIZE(pmw3610_devs); i++) {
-        pmw3610_set_performance(pmw3610_devs[i], enable);
+    for (size_t i = 0; i < ARRAY_SIZE(pmw3320_devs); i++) {
+        pmw3320_set_performance(pmw3320_devs[i], enable);
     }
 
     return 0;
 }
 
-ZMK_LISTENER(zmk_pmw3610_idle_sleeper, on_activity_state);
-ZMK_SUBSCRIPTION(zmk_pmw3610_idle_sleeper, zmk_activity_state_changed);
+ZMK_LISTENER(zmk_pmw3320_idle_sleeper, on_activity_state);
+ZMK_SUBSCRIPTION(zmk_pmw3320_idle_sleeper, zmk_activity_state_changed);

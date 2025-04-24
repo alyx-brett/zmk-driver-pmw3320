@@ -64,12 +64,12 @@ extern "C" {
 #define PMW3320_REG_MOTION_BURST 0x63
 
 /* Burst read parameters */
-#define PMW3320_BURST_SIZE 10
+#define PMW3320_BURST_SIZE 8
 #define PMW3320_X_L_POS 0
 #define PMW3320_Y_L_POS 1
 #define PMW3320_SHUTTER_H_POS 3
 #define PMW3320_SHUTTER_L_POS 4
-#define PMW3320_XY_H_POS 9
+#define PMW3320_XY_H_POS 2
 
 /* cpi/resolution range */
 #define PMW3320_MAX_CPI 3500
