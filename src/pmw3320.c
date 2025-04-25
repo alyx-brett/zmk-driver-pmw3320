@@ -109,7 +109,6 @@ static int pmw3320_set_cpi(const struct device *dev, uint32_t cpi) {
     return 0;
 }
 
-/* Set sampling rate in each mode (in ms) */
 static int pmw3320_set_sample_time(const struct device *dev, uint8_t reg_addr, uint32_t sample_time) {
     uint32_t maxtime = 2550;
     uint32_t mintime = 10;
@@ -130,10 +129,11 @@ static int pmw3320_set_sample_time(const struct device *dev, uint8_t reg_addr, u
     return err;
 }
 
-/* Set downshift time in ms. */
+// TODO Alyx: I don't see that this is true
 // NOTE: The unit of run-mode downshift is related to pos mode rate, which is hard coded to be 4 ms
 // The pos-mode rate is configured in pmw3320_async_init_configure
 static int pmw3320_set_downshift_time(const struct device *dev, uint8_t reg_addr, uint32_t time) {
+    /* All times in ms */
     uint32_t maxtime;
     uint32_t mintime;
 
@@ -145,7 +145,6 @@ static int pmw3320_set_downshift_time(const struct device *dev, uint8_t reg_addr
         maxtime = 8160; // 32 * 255;
         mintime = 32; // hard-coded in pmw3320_async_init_configure
         break;
-
     case PMW3320_REG_REST1_DOWNSHIFT:
         /* Rest1 downshift time = PMW3320_REG_RUN_DOWNSHIFT
          *                        * 16 * Rest1_sample_period (default 40 ms)
@@ -153,7 +152,6 @@ static int pmw3320_set_downshift_time(const struct device *dev, uint8_t reg_addr
         maxtime = 255 * 16 * CONFIG_PMW3320_REST1_SAMPLE_TIME_MS;
         mintime = 16 * CONFIG_PMW3320_REST1_SAMPLE_TIME_MS;
         break;
-
     case PMW3320_REG_REST2_DOWNSHIFT:
         /* Rest2 downshift time = PMW3320_REG_REST2_DOWNSHIFT
          *                        * 128 * Rest2 rate (default 100 ms)
@@ -161,7 +159,6 @@ static int pmw3320_set_downshift_time(const struct device *dev, uint8_t reg_addr
         maxtime = 255 * 128 * CONFIG_PMW3320_REST2_SAMPLE_TIME_MS;
         mintime = 128 * CONFIG_PMW3320_REST2_SAMPLE_TIME_MS;
         break;
-
     default:
         LOG_ERR("Not supported");
         return -ENOTSUP;
@@ -171,7 +168,6 @@ static int pmw3320_set_downshift_time(const struct device *dev, uint8_t reg_addr
         LOG_WRN("Downshift time %u out of range (%u - %u)", time, mintime, maxtime);
         return -EINVAL;
     }
-
     __ASSERT_NO_MSG((mintime > 0) && (maxtime / mintime <= UINT8_MAX));
 
     /* Convert time to register value */
@@ -183,7 +179,6 @@ static int pmw3320_set_downshift_time(const struct device *dev, uint8_t reg_addr
     if (err) {
         LOG_ERR("Failed to change downshift time");
     }
-
     return err;
 }
 
@@ -364,18 +359,6 @@ static int pmw3320_report_data(const struct device *dev) {
     int16_t y = TOINT16((buf[PMW3320_Y_L_POS] + ((buf[PMW3320_XY_H_POS] & 0x0F) << 8)), 12);
     LOG_DBG("x/y: %d/%d", x, y);
 
-#if IS_ENABLED(CONFIG_PMW3320_SWAP_XY)
-    int16_t a = x;
-    x = y;
-    y = a;
-#endif
-#if IS_ENABLED(CONFIG_PMW3320_INVERT_X)
-    x = -x;
-#endif
-#if IS_ENABLED(CONFIG_PMW3320_INVERT_Y)
-    y = -y;
-#endif
-
 #if CONFIG_PMW3320_REPORT_INTERVAL_MIN > 0
     // purge accumulated delta, if last sampled had not been reported on last report tick
     if (now - last_smp_time >= CONFIG_PMW3320_REPORT_INTERVAL_MIN) {
@@ -518,31 +501,24 @@ static int pmw3320_attr_set(const struct device *dev, enum sensor_channel chan,
     case PMW3320_ATTR_CPI:
         err = pmw3320_set_cpi(dev, PMW3320_SVALUE_TO_CPI(*val));
         break;
-
     case PMW3320_ATTR_RUN_DOWNSHIFT_TIME:
         err = pmw3320_set_downshift_time(dev, PMW3320_REG_RUN_DOWNSHIFT, PMW3320_SVALUE_TO_TIME(*val));
         break;
-
     case PMW3320_ATTR_REST1_DOWNSHIFT_TIME:
         err = pmw3320_set_downshift_time(dev, PMW3320_REG_REST1_DOWNSHIFT, PMW3320_SVALUE_TO_TIME(*val));
         break;
-
     case PMW3320_ATTR_REST2_DOWNSHIFT_TIME:
         err = pmw3320_set_downshift_time(dev, PMW3320_REG_REST2_DOWNSHIFT, PMW3320_SVALUE_TO_TIME(*val));
         break;
-
     case PMW3320_ATTR_REST1_SAMPLE_TIME:
         err = pmw3320_set_sample_time(dev, PMW3320_REG_REST1_PERIOD, PMW3320_SVALUE_TO_TIME(*val));
         break;
-
     case PMW3320_ATTR_REST2_SAMPLE_TIME:
         err = pmw3320_set_sample_time(dev, PMW3320_REG_REST2_PERIOD, PMW3320_SVALUE_TO_TIME(*val));
         break;
-
     case PMW3320_ATTR_REST3_SAMPLE_TIME:
         err = pmw3320_set_sample_time(dev, PMW3320_REG_REST3_PERIOD, PMW3320_SVALUE_TO_TIME(*val));
         break;
-
     default:
         LOG_ERR("Unknown attribute");
         err = -ENOTSUP;
